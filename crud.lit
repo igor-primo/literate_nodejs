@@ -1,0 +1,404 @@
+@code_type javascript .js
+
+@title A CRUD
+
+@s Introduction
+
+This project intends to exemplify literate programming with Literate,
+a tool to write literate programs and documentation.
+
+Literate programming is a programming paradigm in which a program
+is given an explanation of its logic in a natural language,
+interspersed with snippets of macros and traditional source code,
+from which compilable source code can be generated.
+
+This practice is believed to facilitate documentation
+by forcing the developer to write source code and documentation
+in the same file. It is also believed to encourage
+better thinking by stimulating higher-level explanation
+of the code.
+
+We will design a simple CRUD app. 
+
+As of 06/07/2022 the requirements are the following:
+<ul>
+    <div><input type="checkbox" checked><label>The user must be able to sign up.</label></div>
+    <ul>
+        <li>Implemented. 06/08/2022</li>
+    </ul>
+    <div><input type="checkbox" checked><label>The user must be able to delete his credentials from the database (akin to profile deletion).</label></div>
+    <ul><li>Implemented. 06/08/2022</li></ul>
+    <div><input type="checkbox" checked><label>The user must be able to change one's credentials.</label></div>
+    <ul><li>Implemented. 06/08/2022</li></ul>
+    <div><input type="checkbox" checked><label>The user must be able to acquire a JSON Web Token by authenticating himself.</label></div>
+    <ul>
+    <li>Implemented. 06/08/2022</li>
+    </ul>
+    <div><input type="checkbox" checked><label>The user must be able to verify his token.</label></div>
+    <ul>
+        <li>Implemented. 06/08/2022</li>
+    </ul>
+    <div><input type="checkbox" checked><label>Emails must be unique</label></div>
+    <ul><li>Implemented. 06/08/2022</li></ul>
+    <div><input type="checkbox" checked><label>The password will be encrypted using asymmetric cryptography</label></div>
+    <ul><li>Implemented. 06/08/2022</li></ul>
+</ul>
+
+@s The files
+
+The files our project will contain are the following:
+
+<ul>
+    <li>index.js (main program)</li>
+    <li>db.js (database connection provider)</li>
+    <li>user.js (class that will provide the functionalities)</li>
+    <li>utils.js (class that will provide useful methods for repeated operations)</li>
+    <li>error.js (class to handle errors)</li>
+</ul>
+
+The dependencies our project will have are the following:
+
+<ul>
+    <li>http (to create the http server)</li>
+    <li>bcrypjs (to hash and compare passwords)</li>
+    <li>pg (node-postgres) (to connect to and communicate with the database)</li>
+    <li>jsonwebtoken (to sign and verify jwts)</li>
+    <li>nodemon (to monitor file alterations in development phase)</li>
+</ul>
+
+@s index.js
+
+The main file, index.js, will create an HTTP server.
+
+--- index.js
+// Import http code
+const http = require('http');
+// Import utils code to access helper utilities
+const utils_c = require('./utils');
+// Import user code to access app functionalities
+const user_c = require('./user');
+
+// Create the objects
+const utils = new utils_c();
+const user = new user_c();
+
+// This function will handle requests
+async function handler(req, res){
+    const url = req.url;
+    const met = req.method;
+    if(url === '/api/user' && met === 'POST'){  // Sign up
+        await user.signup(req, res);
+    } else if(url === '/api/user' && met === 'DELETE'){ // Delete credentials
+        const id = await user.authenticate(req, res); // User needs to be autheticated first.
+                                                      // That is, in possenssion of a JWT.
+        if(id)
+            await user.delete_user(id, req, res);
+    } else if(url === '/api/user' && met === 'PUT'){ // Change credentials
+        const id = await user.authenticate(req, res); // User needs to be autheticated first.
+                                                      // That is, in possenssion of a JWT.
+        if(id)
+            await user.put(id, req, res);
+    } else if(url.match(/\/api\/authenticate\?*/) && met === 'GET'){ // Get a token
+        await user.get_token(req, res);
+    } else if(url.match(/\/api\/verify_token\?*/) && met === 'GET'){ // Verify token
+        await user.verify_token(req, res);
+    } else
+        utils.respond('Route not found', 404, res);
+}
+
+const PORT = process.env.PORT || 5000;
+http.createServer(handler).listen(PORT);
+---
+
+@s user.js
+
+The user.js file will contain the hard logic of the application.
+
+--- user.js
+const bcrypt = require('bcryptjs'); // To hash and compare passwords.
+const jwt = require('jsonwebtoken'); // To sign and verify jwts
+const utils_c = require('./utils');
+const error = require('./error');
+const db = require('./db'); // To provide connection to DB
+
+const utils = new utils_c();
+
+class user {
+    constructor(){}
+    async signup(req, res){
+        req.on('data', async chunk => {
+            try {
+                const body = await JSON.parse(chunk.toString());
+                const {name, email, password} = body;
+                if(!(name && email && password))
+                    throw new error('We need the name, the email and the password.', 300);
+                if(!utils.string_in_bounds(name, 1, 20))
+                    throw new error('Name need to contain at most 20 characters');
+                if(!utils.string_in_bounds(email, 1, 20))
+                    throw new error('Email need to contain at most 20 characters');
+                if(!utils.string_in_bounds(password, 1, 20))
+                    throw new error('Password need to contain at most 20 characters');
+                if(!utils.valid_email(email))
+                    throw new error('Email invalid.', 300); // We need to check email validity
+                // We will store the hash, not the bare password.
+                const hash = await bcrypt.hash(password, 10); 
+                // Let's first check if this user is already registered. 
+                // Emails are unique, so we will use it.
+                const registered_q = `SELECT id FROM users WHERE email = $1`;
+                const registered_v = [ email ];
+                const registered_query = await db.query(registered_q, registered_v);
+                if(!(registered_query.rows.length == 0))
+                    throw new error('User already registered', 300);
+                const q = `INSERT INTO users VALUES(DEFAULT, $1, $2, $3) RETURNING id`;
+                const v = [ name, email, hash ];
+                const { rows } = await db.query(q, v);
+                const id = rows[0].id;
+                // Now we need to provide a token to the user.
+                const token = jwt.sign({id}, process.env.PRIVATE_KEY, {algorithm: 'RS256'});
+                utils.respond(token, 201, res);
+            } catch(e) {
+                console.log(e.message); //DEBUG
+                if(!(e instanceof error))
+                    return utils.respond('Internal error', 500, res);
+                return utils.respond(e.message, e.status, res);
+            }
+        });
+        req.on('error', err => {
+            utils.respond('Internal error', 500, res);
+        });
+    }
+    @{Authenticate function}
+    @{Get token function}
+    @{Verify token function}
+    @{Put function}
+    @{Delete function}
+}
+
+module.exports = user;
+---
+
+But, before proceeding, let us test this code by creating the db.js, utils.js and error.js files and then using them.
+
+@s db.js
+
+This file shall provide a connection to the database and a query function.
+
+--- db.js
+const { Pool } = require('pg');
+
+// Here we create a pool of clients
+// The pool is handled by the pg code itself.
+// So, unless we use transactions, we need not
+// worry about creating and destroying clients.
+const pool = new Pool({
+    connectionString: process.env.DATABASE_CRUD,
+    ssl: {
+        rejectUnauthorized: false, // Useful for testing purposes
+    }
+});
+
+module.exports = {
+    // The pg code takes the respnsibility of creating and destroying
+    // a client for these simple atomic queries,
+    async query(t, p){ return await pool.query(t, p); } 
+    // We might as well create a function to wrap code to simplify
+    // transactions, but we won't need it.
+};
+---
+
+Let us now proceed to utils.js
+
+@s utils.js
+
+This file shall give us wrappers for
+code that we predict will be repeated.
+
+--- utils.js
+class util {
+    constructor(){
+
+        this.EMAIL_REG = /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/;
+
+    }
+    respond(message, status, res){
+        // We write the status code and the content type into the response headers
+        // We use application/json to simplify our lives
+        res.writeHead(status, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({msg: message}));
+    }
+    valid_email(email){
+        return email.match(this.EMAIL_REG);
+    }
+    string_in_bounds(str, min, max){
+        return min <= str.length && str.length <= max;
+    }
+}
+
+module.exports = util;
+---
+
+@s error.js
+
+This file shall contain an extension of the Error class
+to suit our purposes.
+
+--- error.js
+class error extends Error {
+    constructor(message, status){
+        super(message);
+        this.status = status;
+    }
+}
+
+module.exports = error;
+---
+
+@s Finishing user.js
+
+--- Authenticate function
+async authenticate(req, res) {
+    try {
+        const auth = req.headers['authorization'];
+        const token = auth ? auth.split('Bearer ')[1] : null; // We take the token from the Authorization header.
+        if(!token)
+            throw new error('I need a JWT to authenticate you.', 401);
+        const valid = await jwt.verify(token, process.env.PUBLIC_KEY, {algorithms: ['RS256']});
+        if(!valid)
+            throw new error('Invalid token', 401);
+        return valid.id; // Return id. Our functionalities are executed only if this id is returned.
+    } catch(e) {
+        if(!(e instanceof error))
+            return utils.respond('Internal error', 500, res); // In case db fails
+        return utils.respond(e.message, e.status, res);
+    }
+}
+---
+
+--- Get token function
+async get_token(req, res){
+    try {
+        const params = new URLSearchParams(req.url.split('?')[1]).entries(); // Password and email are passed by query parameters.
+        let email = '';
+        let password = '';
+        for(const param of params){
+            switch(param[0]){
+                case 'email':
+                    email = param[1];
+                    break;
+                case 'password':
+                    password = param[1];
+                    break;
+                default:
+                    break;
+            }
+        }
+        if(!(email.length > 0))
+            throw new error('I need your email', 401);
+        if(!(utils.valid_email(email)))
+            throw new error('Email invalid.', 401);
+        if(!(password.length > 0))
+            throw new error('I need your password', 401);
+        const q = `SELECT id, password FROM users WHERE email = $1;`;
+        const v = [ email ];
+        const { rows } = await db.query(q, v);
+        if(rows.length == 0)
+            throw new error('User not in the database or incorrect password.', 401);
+        if(!bcrypt.compareSync(password, rows[0].password))
+            throw new error('User not in the database or incorrect password.', 401);
+        const id = rows[0].id;
+        const token = jwt.sign({id}, process.env.PRIVATE_KEY, {algorithm: 'RS256'});
+        utils.respond(token, 200, res);
+    } catch(e) {
+        if(!(e instanceof error))
+            return utils.respond('Internal error', 500, res);
+        return utils.respond(e.message, e.status, res);
+    }
+}
+---
+
+--- Verify token function
+async verify_token(req, res){
+    try {
+        const auth = req.headers['authorization'];
+        const token = auth ? auth.split('Bearer ')[1] : null; // We take the token from the Authorization header.
+        if(!token){
+            // If the token is not found in the authorization header, seek it in the query params
+            const token_param = new URLSearchParams(req.url.split('?')[1]).entries();
+            let token_p = '';
+            for(const param of token_param){
+                console.log(param); //DEBUG
+                if(param[0] === 'token') token_p = param[1];
+            }
+            if(token_p.length == 0)
+                throw new error('I need a JWT to authenticate you.', 401);
+            const valid_p = await jwt.verify(token_p, process.env.PUBLIC_KEY, {algorithms: ['RS256']});
+            if(!valid_p)
+                throw new error('Invalid token', 401);
+            return utils.respond('Token OK', 200, res);
+        }
+        const valid = await jwt.verify(token, process.env.PUBLIC_KEY, {algorithms: ['RS256']});
+        if(!valid)
+            throw new error('Invalid token', 401);
+        utils.respond('Token OK', 200, res);
+    } catch(e) {
+        if(!(e instanceof error))
+            return utils.respond('Internal error', 500, res);
+        return utils.respond(e.message, e.status, res);
+    }
+}
+---
+
+--- Put function
+async put(id, req, res){
+    req.on('data', async chunk => {
+        try {
+            const body = await JSON.parse(chunk.toString());
+            const { name, email, password } = body;
+            console.log(body); //DEBUG
+            if(!(name && email && password))
+                throw new error('We need the name, the email and the password.', 300);
+            if(!utils.string_in_bounds(name, 1, 20))
+                throw new error('Name need to contain at most 20 characters');
+            if(!utils.string_in_bounds(email, 1, 20))
+                throw new error('Email need to contain at most 20 characters');
+            if(!utils.string_in_bounds(password, 1, 20))
+                throw new error('Password need to contain at most 20 characters');
+            if(!utils.valid_email(email))
+                throw new error('Email invalid.', 300); // We need to check email validity
+            // Check if user exists
+            const { rows } = await db.query(`SELECT id FROM users WHERE id = $1;`, [ id ]);
+            if(rows.length == 0)
+                throw new error('User not registered.', 401);
+            const hash = await bcrypt.hash(password, 10);
+            const q = `UPDATE users SET name = $1, email = $2, password = $3 WHERE  id = $4;`;   
+            const v = [ name, email, hash, id ];
+            await db.query(q, v);
+            utils.respond('User modified with success', 200, res);
+        } catch(e) {
+            console.log(e.message); //DEBUG
+            if(!(e instanceof error))
+                return utils.respond('Internal error', 500, res);
+            return utils.respond(e.message, e.status, res);
+        }
+    });
+    req.on('error', err => {
+        return utils.respond('Internal error', 500, res);
+    });
+}
+---
+
+--- Delete function
+async delete_user(id, req, res){
+    try {
+        const { rows } = await db.query(`SELECT id FROM users WHERE id = $1;`, [ id ]);
+        if(rows.length == 0)
+            throw new error('User not registered.', 401);
+        await db.query(`DELETE FROM users WHERE id = $1;`, [ id ]);
+        utils.respond('User delete with success', 200, res);
+    } catch(e) {
+        if(!(e instanceof error))
+            return utils.respond('Internal error', 500, res);
+        return utils.respond('User delete with success', 200, res);
+    }
+}
+---
